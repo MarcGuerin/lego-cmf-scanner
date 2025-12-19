@@ -1,1 +1,275 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Scanner LEGO CMF (D&D)</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 0; }
+    .wrap { max-width: 880px; margin: 0 auto; padding: 16px; }
+    h1 { margin: 8px 0 6px; }
+    .hint { color:#444; line-height:1.35; }
+    .row { display:flex; gap:12px; flex-wrap:wrap; align-items:center; margin: 12px 0; }
+    button, input { font-size: 16px; padding: 10px 12px; }
+    button { cursor: pointer; }
+    video { width: 100%; max-height: 420px; background:#111; border-radius: 12px; }
+    .card { border: 1px solid #ddd; border-radius: 12px; padding: 12px; margin-top: 12px; }
+    .ok { color: #0a7a0a; font-weight: 700; }
+    .bad { color: #b00020; font-weight: 700; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    .small { font-size: 13px; color:#555; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Scanner LEGO CMF — Dungeons & Dragons</h1>
+    <div class="hint">
+      Autorise la caméra, vise le <b>grand code carré Data-Matrix</b> sous la boîte.
+      Cache le code-barres avec un doigt pour éviter une lecture erronée.
+    </div>
+
+    <div class="row">
+      <button id="btnStart">Démarrer la caméra</button>
+      <button id="btnStop" disabled>Arrêter</button>
+
+      <label>
+        <input id="file" type="file" accept="image/*" capture="environment" />
+      </label>
+    </div>
+
+    <video id="video" playsinline></video>
+
+    <div class="card">
+      <div><b>Résultat</b></div>
+      <div id="status" class="small">En attente…</div>
+      <div id="decoded" class="mono small"></div>
+      <div id="name" style="margin-top:6px;font-size:18px;"></div>
+    </div>
+
+    <div class="card">
+      <div><b>Saisie manuelle</b></div>
+      <div class="row">
+        <input id="manual" placeholder="Ex : 6506754" inputmode="numeric" />
+        <button id="btnLookup">Chercher</button>
+      </div>
+      <div class="small">Astuce : entre seulement les 7 chiffres.</div>
+    </div>
+
+    <div class="card small">
+      <div><b>Vie privée</b> : tout reste sur ton appareil. Rien n’est envoyé sur Internet.</div>
+      <div id="support" class="small" style="margin-top:6px;"></div>
+    </div>
+  </div>
+
+<script>
+  // === 1) Dictionnaire D&D (7 chiffres -> figurine) ===
+  const codeNames = {
+    "6506754": "Dwarf Barbarian",
+    "6506757": "Gith Warlock",
+    "6506751": "Tiefling Sorcerer",
+    "6506755": "Dragonborn Paladin",
+    "6506753": "Halfling Druid",
+    "6506756": "Aarakocra Ranger",
+    "6506758": "Mind Flayer",
+    "6506760": "Strahd von Zarovich",
+    "6506752": "Elf Bard",
+    "6506759": "The Lady of Pain",
+    "6506762": "Szass Tam",
+    "6506761": "Tasha the Witch Queen"
+  };
+
+  // === 2) UI helpers ===
+  const $ = (id) => document.getElementById(id);
+  const statusEl = $("status");
+  const decodedEl = $("decoded");
+  const nameEl = $("name");
+  const video = $("video");
+  const btnStart = $("btnStart");
+  const btnStop  = $("btnStop");
+  const fileInput = $("file");
+  const manual = $("manual");
+
+  function setStatus(msg, kind="") {
+    statusEl.textContent = msg;
+    statusEl.className = "small " + (kind ? kind : "");
+  }
+  function showDecoded(raw) {
+    decodedEl.textContent = raw ? `Décodé : ${raw}` : "";
+  }
+  function normalizeTo7Digits(text) {
+    if (!text) return "";
+    // Extrait la première séquence de 7 chiffres trouvée
+    const m = String(text).match(/\d{7}/);
+    return m ? m[0] : "";
+  }
+  function lookupAndShow(code7, raw="") {
+    const key = String(code7 || "").trim();
+    const name = codeNames[key];
+    showDecoded(raw);
+    if (name) {
+      nameEl.innerHTML = `<span class="ok">${name}</span> <span class="small">(code ${key})</span>`;
+      setStatus("Figurine trouvée ✅", "");
+    } else {
+      nameEl.innerHTML = `<span class="bad">Inconnu</span> <span class="small">(code ${key || "—"})</span>`;
+      setStatus("Aucune correspondance dans le dictionnaire.", "");
+    }
+  }
+
+  // === 3) BarcodeDetector ===
+  const supportEl = $("support");
+  const hasBarcodeDetector = ("BarcodeDetector" in window);
+  supportEl.textContent = hasBarcodeDetector
+    ? "BarcodeDetector : disponible sur ce navigateur."
+    : "BarcodeDetector : non disponible ici. Utilise un navigateur plus récent, ou l’option Photo + saisie manuelle.";
+
+  let detector = null;
+  let stream = null;
+  let scanning = false;
+
+  async function initDetector() {
+    if (!hasBarcodeDetector) return null;
+
+    // Types possibles (varient selon navigateur). On tente data_matrix + qr_code + code_128
+    const wanted = ["data_matrix", "qr_code", "code_128", "ean_13", "upc_a"];
+    try {
+      const supported = await BarcodeDetector.getSupportedFormats();
+      const formats = wanted.filter(f => supported.includes(f));
+      detector = new BarcodeDetector({ formats: formats.length ? formats : supported });
+      return detector;
+    } catch (e) {
+      console.error(e);
+      return null;
+    }
+  }
+
+  async function startCamera() {
+    setStatus("Démarrage caméra…");
+    nameEl.textContent = "";
+    decodedEl.textContent = "";
+
+    // iOS/Safari: HTTPS + action utilisateur requise
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: { ideal: "environment" } },
+      audio: false
+    });
+
+    video.srcObject = stream;
+    await video.play();
+    setStatus("Caméra prête. Vise le Data-Matrix.");
+    btnStart.disabled = true;
+    btnStop.disabled = false;
+  }
+
+  function stopCamera() {
+    scanning = false;
+    if (stream) {
+      stream.getTracks().forEach(t => t.stop());
+      stream = null;
+    }
+    video.srcObject = null;
+    btnStart.disabled = false;
+    btnStop.disabled = true;
+    setStatus("Caméra arrêtée.");
+  }
+
+  async function scanLoop() {
+    if (!detector) detector = await initDetector();
+    if (!detector) {
+      setStatus("BarcodeDetector indisponible. Utilise Photo + saisie manuelle.", "bad");
+      return;
+    }
+    if (!stream) {
+      setStatus("Caméra non démarrée.", "bad");
+      return;
+    }
+
+    scanning = true;
+    setStatus("Scan en cours… Approche la boîte, bonne lumière, stable.");
+
+    while (scanning) {
+      try {
+        const barcodes = await detector.detect(video);
+        if (barcodes && barcodes.length) {
+          // On prend le premier (ou tu peux filtrer par format)
+          const raw = barcodes[0].rawValue || "";
+          const code7 = normalizeTo7Digits(raw) || (String(raw).trim().slice(0,7));
+          if (code7) {
+            lookupAndShow(code7, raw);
+            // Stop auto après succès (optionnel)
+            scanning = false;
+            setStatus("Scan réussi ✅ (arrêt automatique)");
+          }
+        }
+      } catch (e) {
+        console.error(e);
+      }
+      await new Promise(r => setTimeout(r, 150));
+    }
+  }
+
+  // === 4) Photo -> decode via BarcodeDetector (si dispo) ===
+  async function decodeImageFile(file) {
+    if (!file) return;
+    if (!detector) detector = await initDetector();
+    if (!detector) {
+      setStatus("Impossible de décoder la photo sans BarcodeDetector. Essaie Chrome/Safari à jour.", "bad");
+      return;
+    }
+    setStatus("Analyse de la photo…");
+    const img = new Image();
+    const url = URL.createObjectURL(file);
+    img.src = url;
+    await img.decode();
+
+    const canvas = document.createElement("canvas");
+    canvas.width = img.naturalWidth;
+    canvas.height = img.naturalHeight;
+    const ctx = canvas.getContext("2d");
+    ctx.drawImage(img, 0, 0);
+
+    try {
+      const barcodes = await detector.detect(canvas);
+      if (barcodes && barcodes.length) {
+        const raw = barcodes[0].rawValue || "";
+        const code7 = normalizeTo7Digits(raw) || (String(raw).trim().slice(0,7));
+        lookupAndShow(code7, raw);
+      } else {
+        setStatus("Aucun code détecté sur la photo. Essaie une photo plus nette.", "bad");
+        nameEl.textContent = "";
+        decodedEl.textContent = "";
+      }
+    } catch (e) {
+      console.error(e);
+      setStatus("Erreur pendant le décodage. Essaie une autre photo.", "bad");
+    } finally {
+      URL.revokeObjectURL(url);
+    }
+  }
+
+  // === 5) Wire UI ===
+  btnStart.addEventListener("click", async () => {
+    try {
+      await startCamera();
+      await scanLoop();
+    } catch (e) {
+      console.error(e);
+      setStatus("Impossible d’accéder à la caméra. Vérifie les permissions et que la page est en HTTPS.", "bad");
+    }
+  });
+  btnStop.addEventListener("click", () => stopCamera());
+
+  fileInput.addEventListener("change", async (e) => {
+    const file = e.target.files && e.target.files[0];
+    if (!file) return;
+    await decodeImageFile(file);
+    fileInput.value = "";
+  });
+
+  $("btnLookup").addEventListener("click", () => {
+    const key = normalizeTo7Digits(manual.value) || manual.value.trim();
+    lookupAndShow(key, key);
+  });
+</script>
+</body>
+</html>
 
